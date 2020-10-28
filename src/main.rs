@@ -1,26 +1,32 @@
 #![allow(unused_variables)]
 #![allow(unused_imports)]
 
+use std::env;
+use std::io::{self, Write};
+use std::process;
+use std::sync::Mutex;
+
 use actix::prelude::*;
 use actix_files as fs;
 use actix_web::{
-    get, middleware, post, web, App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
+    App, Error, HttpRequest, HttpResponse, HttpServer, Responder, web,
 };
 use actix_web_actors::ws;
+use clap;
 use serde_json::json;
-use std::env;
-use std::io::{self, Read, Write};
-use std::net::TcpListener;
-use std::net::TcpStream;
-use std::process;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
-//use sysfs_gpio::{Direction, Pin};
+use crate::web_socket::ClientWebSocket;
 
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
-const OPTOCOUPLE_PIN_GPIO_NO: u8 = 7;
+#[cfg(target_os = "linux")]
+use crate::gpio::GpioActor;
+#[cfg(target_os = "linux")]
+use crate::display::DisplayActor;
+
+mod relay;
+mod web_socket;
+#[cfg(target_os = "linux")]
+mod gpio;
+#[cfg(target_os = "linux")]
+mod display;
 
 type Port = u16;
 
@@ -55,88 +61,16 @@ impl Program {
     }
 }
 
-struct Inputs {
-    number: usize,
-    states: Vec<u8>,
-}
-
-struct AppState {
-    inputs: Mutex<Inputs>,
-}
-
-struct ClientWebSocket {
-    hb: Instant,
-    data: web::Data<AppState>,
-}
-
-impl Actor for ClientWebSocket {
-    type Context = ws::WebsocketContext<Self>;
-
-    fn started(&mut self, ctx: &mut Self::Context) {
-        self.hb(ctx);
-    }
-}
-
-impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for ClientWebSocket {
-    fn handle(&mut self, msg: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
-        println!("WS: {:?}", msg);
-
-        match msg {
-            Ok(ws::Message::Ping(msg)) => {
-                self.hb = Instant::now();
-                ctx.pong(&msg);
-            }
-            Ok(ws::Message::Pong(_)) => {
-                self.hb = Instant::now();
-            }
-            Ok(ws::Message::Text(text)) => ctx.text(text),
-            Ok(ws::Message::Binary(bin)) => ctx.binary(bin),
-            Ok(ws::Message::Close(reason)) => {
-                ctx.close(reason);
-                ctx.stop();
-            }
-            _ => ctx.stop(),
-        }
-    }
-}
-
-impl ClientWebSocket {
-    fn new(data: web::Data<AppState>) -> Self {
-        Self {
-            hb: Instant::now(),
-            data,
-        }
-    }
-
-    fn hb(&self, ctx: &mut <Self as Actor>::Context) {
-        ctx.run_interval(HEARTBEAT_INTERVAL, |act, ctx| {
-            // check client heartbeats
-            if Instant::now().duration_since(act.hb) > CLIENT_TIMEOUT {
-                // heartbeat timed out
-                println!("Websocket Client heartbeat failed, disconnecting!");
-                ctx.stop();
-
-                return;
-            }
-
-            ctx.ping(b"");
-
-            let inputs = act.data.inputs.lock().unwrap();
-            ctx.text(json!(inputs.states).to_string());
-        });
-    }
-}
-
 async fn ws_index(
     r: HttpRequest,
     stream: web::Payload,
-    data: web::Data<AppState>,
+    relay: web::Data<Addr<relay::RelayActor>>,
 ) -> Result<HttpResponse, Error> {
-    ws::start(ClientWebSocket::new(data), &r, stream)
+    ws::start(web_socket::ClientWebSocket::new(relay.get_ref().clone()), &r, stream)
 }
 
-async fn inputs(data: web::Data<AppState>) -> impl Responder {
-    let inputs = data.inputs.lock().unwrap();
+async fn inputs(data: web::Data<Mutex<relay::Inputs>>) -> impl Responder {
+    let inputs = data.lock().unwrap();
 
     HttpResponse::Ok().body(json!({
         "number": inputs.number,
@@ -146,20 +80,40 @@ async fn inputs(data: web::Data<AppState>) -> impl Responder {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    let matches = clap::App::new("ajax_alarm")
+        .version("1.0")
+        .author("Andrei Klaptsov <skyggedanser@gmail.com>")
+        .about("WebSocket and GPIO gateway for TCP-KP-I404 and similar network relays")
+        .arg(clap::Arg::new("host")
+            .short('h')
+            .long("relay-host")
+            .value_name("HOST")
+            .about("Relay host"))
+        .arg(clap::Arg::new("port")
+            .short('p')
+            .long("relay-port")
+            .value_name("PORT")
+            .about("Relay port, defaults to 12345"))
+        .arg(clap::Arg::new("inputs_number")
+            .short('i')
+            .long("inputs-number")
+            .value_name("NUMBER")
+            .about("Number of inputs, defaults to 4"))
+        .get_matches();
+
     let mut args = env::args();
     let program = Program::new(args.next().unwrap_or("ajax_alarm".to_string()));
 
-    let host = args.next().unwrap_or_else(|| {
-        program.usage();
-        program.fail();
-    });
-
-    let port = args
-        .next()
+    let host = matches.value_of("host")
         .unwrap_or_else(|| {
+            program.print_error("invalid host".to_string());
             program.usage();
             program.fail();
         })
+        .to_string();
+
+    let port = matches.value_of("port")
+        .unwrap_or("12345")
         .parse::<Port>()
         .unwrap_or_else(|error| {
             program.print_error(format!("invalid port number: {}", error));
@@ -167,110 +121,30 @@ async fn main() -> std::io::Result<()> {
             program.fail();
         });
 
-    let input_number = args
-        .next()
-        .unwrap_or("4".to_string())
+    let inputs_number = matches.value_of("inputs_number")
+        .unwrap_or("4")
         .parse::<usize>()
         .unwrap_or_else(|error| {
-            program.print_error(format!("invalid input number: {}", error));
+            program.print_error(format!("invalid inputs number: {}", error));
             program.usage();
             program.fail();
         });
 
-    let mut stream = TcpStream::connect((host.as_str(), port))
-        .unwrap_or_else(|error| program.print_fail(error.to_string()));
+    let relay = Supervisor::start(move |_| relay::RelayActor::new(host, port, inputs_number));
 
-    let mut input_stream = stream.try_clone().unwrap();
+    #[cfg(target_os = "linux")] {
+        let gpio = GpioActor::new(relay.clone()).start();
+        let display = DisplayActor::new(relay.clone()).start();
+    }
 
-    let app_state = web::Data::new(AppState {
-        inputs: Mutex::new(Inputs {
-            number: input_number,
-            states: Vec::new(),
-        }),
-    });
-
-    let app_state_clone = app_state.clone();
-
-    // TX thread
-    thread::spawn(move || {
-        let mut client_buffer = [0u8; 1024];
-        //let my_led = Pin::new(OPTOCOUPLE_PIN_GPIO_NO);
-        let mut input_states = vec![0u8; input_number];
-
-        loop {
-            //my_led.set_value(0).unwrap();
-            thread::sleep(Duration::from_millis(100));
-            match input_stream.read(&mut client_buffer) {
-                Ok(n) => {
-                    if n == 0 {
-                        program.exit(0);
-                    } else {
-                        let received_string =
-                            std::str::from_utf8(&client_buffer).unwrap().to_string();
-
-                        if received_string.starts_with("+OCCH") {
-                            let input_no = received_string
-                                .chars()
-                                .nth(5)
-                                .unwrap()
-                                .to_digit(10)
-                                .unwrap() as usize;
-                            let input_state = received_string
-                                .chars()
-                                .nth(7)
-                                .unwrap()
-                                .to_digit(10)
-                                .unwrap() as u8;
-
-                            *&mut input_states[input_no - 1] = input_state;
-                        }
-
-                        let mut inputs = app_state_clone.inputs.lock().unwrap();
-
-                        inputs.states = input_states.to_vec();
-                        io::stdout().write(&received_string.as_bytes()).unwrap();
-                        io::stdout().flush().unwrap();
-                        //my_led.set_value(1).unwrap();
-
-                        thread::sleep(Duration::from_millis(100));
-                    }
-                }
-                Err(error) => program.print_fail(error.to_string()),
-            }
-        }
-    });
-
-    // RX thread
-    thread::spawn(move || {
-        let output_stream = &mut stream;
-
-        loop {
-            for input in 1..=input_number {
-                output_stream
-                    .write(format!("AT+OCCH{}=?\n", input).as_bytes())
-                    .unwrap();
-
-                output_stream.flush().unwrap();
-                thread::sleep(Duration::from_millis(100));
-            }
-
-            thread::sleep(Duration::from_millis(1000));
-        }
-    });
-
-    // std::env::set_var("RUST_LOG", "actix_server=info,actix_web=info");
-    // env_logger::init();
     HttpServer::new(move || {
         App::new()
-            // enable logger
-            //.wrap(middleware::Logger::default())
-            // websocket route
-            .app_data(app_state.clone())
+            .data(relay.clone())
             .service(web::resource("/ws/").route(web::get().to(ws_index)))
             .route("/inputs", web::get().to(inputs))
             .service(fs::Files::new("/", "static/").index_file("index.html"))
     })
-    .bind("0.0.0.0:8080")?
-    .run()
-    .await
+        .bind("0.0.0.0:8080")?
+        .run()
+        .await
 }

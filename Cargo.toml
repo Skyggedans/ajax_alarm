@@ -7,13 +7,23 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-# sysfs_gpio = "0.5"
-actix = "0.10"
-actix-codec = "0.3"
-actix-web = "3"
-actix-web-actors = "3"
-actix-files = "0.3"
+actix = "0.10.0"
+actix-codec = "0.3.0"
+actix-web = "3.1.0"
+actix-web-actors = "3.0.0"
+actix-files = "0.4.0"
+clap = "3.0.0-beta.2"
 env_logger = "0.7"
+futures-util = "0.3.7"
+json = "0.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-json = "0.12"
+tokio = { version = "0.2.6", features = ["full", "tracing"] }
+tokio-util = "0.3"
+
+[target.'cfg(unix)'.dependencies]
+display-interface = "0.4"
+display-interface-spi = "0.4"
+embedded-graphics = "0.6.2"
+linux-embedded-hal = "0.2.2"
+st7789 = { path = "../st7789", version = "0.5.0" }
