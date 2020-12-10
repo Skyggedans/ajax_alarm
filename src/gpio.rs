@@ -4,57 +4,61 @@ use actix::prelude::*;
 use linux_embedded_hal::Pin;
 
 use crate::relay;
+use crate::relay::{RelayStatus, RelayActor, RegisterForStatus, UnregisterForStatus};
 
 const OPTOCOUPLE_PIN_GPIO_NO: u64 = 7;
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
 
 pub struct GpioActor {
-    pub relay: Addr<relay::RelayActor>,
+    id: usize,
 }
 
 impl Actor for GpioActor {
     type Context = Context<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        self.start_poll(ctx);
+        RelayActor::from_registry().send(RegisterForStatus(ctx.address().recipient()))
+            .into_actor(self)
+            .then(|res, act, ctx| {
+                match res {
+                    Ok(res) => act.id = res,
+                    _ => ctx.stop(),
+                }
+
+                fut::ready(())
+            })
+            .wait(ctx);
+    }
+
+    fn stopping(&mut self, _: &mut Self::Context) -> Running {
+        RelayActor::from_registry().do_send(UnregisterForStatus(self.id));
+
+        Running::Stop
     }
 }
 
 impl GpioActor {
-    pub fn new(relay: Addr<relay::RelayActor>) -> Self {
+    pub fn new() -> Self {
         Self {
-            relay,
+            id: 0,
         }
     }
 
-    fn start_poll(&self, ctx: &mut <Self as Actor>::Context) {
-        ctx.run_interval(POLL_INTERVAL, |act, ctx| {
-            let res = act.relay.send(relay::GetInputs)
-                .into_actor(act)
-                .then(|res, _, ctx| {
-                    match res {
-                        Ok(inputs) => {
-                            let opto_pin = Pin::new(OPTOCOUPLE_PIN_GPIO_NO);
+    fn set_pins(&self, inputs: Vec<u32>) {
+        let opto_pin = Pin::new(OPTOCOUPLE_PIN_GPIO_NO);
 
-                            match inputs.states.iter().find(|&&input_state| input_state == 1) {
-                                Some(_) => opto_pin.set_value(1).unwrap(),
-                                None => opto_pin.set_value(0).unwrap(),
-                            }
-                        }
-                        Err(err) => {
-                            println!("Something is wrong");
-                        },
-                    }
-                    fut::ready(())
-                })
-                .spawn(ctx);
-        });
+        match inputs.iter().find(|&&input_state| input_state == 1) {
+            Some(_) => opto_pin.set_value(1).unwrap(),
+            None => opto_pin.set_value(0).unwrap(),
+        }
     }
 }
 
-// impl Handler<relay::Inputs> for GpioActor {
-//     type Result = ();
-//
-//     fn handle(&mut self, msg: relay::Inputs, ctx: &mut Self::Context) {
-//     }
-// }
+
+impl Handler<RelayStatus> for GpioActor {
+    type Result = ();
+
+    fn handle(&mut self, message: RelayStatus, ctx: &mut Self::Context) -> Self::Result {
+        self.set_pins(message.inputs);
+    }
+}

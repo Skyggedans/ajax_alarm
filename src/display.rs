@@ -14,48 +14,52 @@ use linux_embedded_hal::spidev::{SPI_MODE_3, SpidevOptions};
 use st7789::{Orientation, ST7789};
 
 use crate::relay;
+use crate::relay::{RelayStatus, RelayActor, RegisterForStatus, UnregisterForStatus};
 
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 pub struct DisplayActor {
-    pub relay: Addr<relay::RelayActor>,
+    pub id: usize,
     display: Option<Mutex<ST7789<SPIInterfaceNoCS<Spidev, Pin>, Pin>>>,
+}
+
+impl Default for DisplayActor {
+    fn default() -> DisplayActor {
+        Self {
+            id: 0,
+            display: None,
+        }
+    }
 }
 
 impl Actor for DisplayActor {
     type Context = Context<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
+        RelayActor::from_registry().send(RegisterForStatus(ctx.address().recipient()))
+            .into_actor(self)
+            .then(|res, act, ctx| {
+                match res {
+                    Ok(res) => act.id = res,
+                    _ => ctx.stop(),
+                }
+
+                fut::ready(())
+            })
+            .wait(ctx);
+
         self.init_display(ctx);
-        self.start_poll(ctx);
+    }
+
+    fn stopping(&mut self, _: &mut Self::Context) -> Running {
+        RelayActor::from_registry().do_send(UnregisterForStatus(self.id));
+
+        Running::Stop
     }
 }
 
 impl DisplayActor {
-    pub fn new(relay: Addr<relay::RelayActor>) -> Self {
-        Self {
-            relay,
-            display: None,
-        }
-    }
-
-    fn start_poll(&mut self, ctx: &mut <Self as Actor>::Context) {
-        ctx.run_interval(POLL_INTERVAL, |act, ctx| {
-            let res = act.relay.send(relay::GetInputs)
-                .into_actor(act)
-                .then(|res, act, ctx| {
-                    match res {
-                        Ok(inputs) => {
-                            act.draw(inputs);
-                        }
-                        Err(err) => {
-                            println!("Something is wrong");
-                        }
-                    }
-                    fut::ready(())
-                })
-                .spawn(ctx);
-        });
+    pub fn new() -> Self {
+        Self::default()
     }
 
     fn init_display(&mut self, ctx: &mut <Self as Actor>::Context) {
@@ -81,8 +85,8 @@ impl DisplayActor {
         self.display = Some(Mutex::new(display));
     }
 
-    fn draw(&self, inputs: relay::Inputs) {
-        if let Some(val) = self.display.as_ref() {
+    fn draw_status(&mut self, connected: bool, inputs: Vec<u32>) {
+        if let Some(ref mut val) = self.display {
             let display = &mut *val.lock().unwrap();
             let text_style = TextStyle::new(Font24x32, Rgb565::WHITE);
             let inactive_style = PrimitiveStyle::with_fill(Rgb565::GREEN);
@@ -90,28 +94,28 @@ impl DisplayActor {
 
             let input1_circle =
                 Circle::new(Point::new(60, 60), 40)
-                    .into_styled(if inputs.states[0] == 0 { inactive_style } else { active_style });
+                    .into_styled(if inputs[0] == 0 { inactive_style } else { active_style });
 
             let input1_text = Text::new("1", Point::new(50, 50))
                 .into_styled(text_style);
 
             let input2_circle =
                 Circle::new(Point::new(180, 60), 40)
-                    .into_styled(if inputs.states[1] == 0 { inactive_style } else { active_style });
+                    .into_styled(if inputs[1] == 0 { inactive_style } else { active_style });
 
             let input2_text = Text::new("2", Point::new(170, 50))
                 .into_styled(text_style);
 
             let input3_circle =
                 Circle::new(Point::new(60, 180), 40)
-                    .into_styled(if inputs.states[2] == 0 { inactive_style } else { active_style });
+                    .into_styled(if inputs[2] == 0 { inactive_style } else { active_style });
 
             let input3_text = Text::new("3", Point::new(50, 170))
                 .into_styled(text_style);
 
             let input4_circle =
                 Circle::new(Point::new(180, 180), 40)
-                    .into_styled(if inputs.states[3] == 0 { inactive_style } else { active_style });
+                    .into_styled(if inputs[3] == 0 { inactive_style } else { active_style });
 
             let input4_text = Text::new("4", Point::new(170, 170))
                 .into_styled(text_style);
@@ -128,9 +132,10 @@ impl DisplayActor {
     }
 }
 
-// impl Handler<relay::Inputs> for GpioActor {
-//     type Result = ();
-//
-//     fn handle(&mut self, msg: relay::Inputs, ctx: &mut Self::Context) {
-//     }
-// }
+impl Handler<RelayStatus> for DisplayActor {
+    type Result = ();
+
+    fn handle(&mut self, message: RelayStatus, ctx: &mut Self::Context) -> Self::Result {
+        self.draw_status(message.connected, message.inputs);
+    }
+}

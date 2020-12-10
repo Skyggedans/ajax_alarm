@@ -7,6 +7,7 @@ use std::process;
 use std::sync::Mutex;
 
 use actix::prelude::*;
+use actix::SystemRegistry;
 use actix_files as fs;
 use actix_web::{
     App, Error, HttpRequest, HttpResponse, HttpServer, Responder, web,
@@ -14,15 +15,18 @@ use actix_web::{
 use actix_web_actors::ws;
 use clap;
 use serde_json::json;
-use crate::web_socket::ClientWebSocket;
 
 #[cfg(target_os = "linux")]
-use crate::gpio::GpioActor;
-#[cfg(target_os = "linux")]
 use crate::display::DisplayActor;
+#[cfg(target_os = "linux")]
+use crate::gpio::GpioActor;
+use crate::relay::{RegisterForStatus, RelayActor, GetInputs, SetOutput};
+use crate::web_socket::ClientWebSocket;
+use actix_web::http::StatusCode;
 
 mod relay;
 mod web_socket;
+
 #[cfg(target_os = "linux")]
 mod gpio;
 #[cfg(target_os = "linux")]
@@ -64,18 +68,30 @@ impl Program {
 async fn ws_index(
     r: HttpRequest,
     stream: web::Payload,
-    relay: web::Data<Addr<relay::RelayActor>>,
 ) -> Result<HttpResponse, Error> {
-    ws::start(web_socket::ClientWebSocket::new(relay.get_ref().clone()), &r, stream)
+    ws::start(ClientWebSocket::new(), &r, stream)
 }
 
-async fn inputs(data: web::Data<Mutex<relay::Inputs>>) -> impl Responder {
-    let inputs = data.lock().unwrap();
+async fn inputs() -> HttpResponse {
+    let res = RelayActor::from_registry().send(GetInputs).await;
 
-    HttpResponse::Ok().body(json!({
-        "number": inputs.number,
-        "states": inputs.states
-    }))
+    match res {
+        Ok(inputs) => {
+            HttpResponse::Ok()
+                .content_type("application/json")
+                .body(json!({
+                "number": inputs.number,
+                "states": inputs.states
+            }))
+        }
+        Err(_) => HttpResponse::NoContent().finish()
+    }
+}
+
+async fn output(web::Path((number, state)): web::Path<(usize, u32)>) -> HttpResponse {
+    let res = RelayActor::from_registry().do_send(SetOutput { number, state });
+
+    HttpResponse::Ok().finish()
 }
 
 #[actix_web::main]
@@ -130,18 +146,20 @@ async fn main() -> std::io::Result<()> {
             program.fail();
         });
 
-    let relay = Supervisor::start(move |_| relay::RelayActor::new(host, port, inputs_number));
+    let relay = Supervisor::start(move |_| RelayActor::new(host, port, inputs_number));
+
+    SystemRegistry::set(relay.clone());
 
     #[cfg(target_os = "linux")] {
-        let gpio = GpioActor::new(relay.clone()).start();
-        let display = DisplayActor::new(relay.clone()).start();
+        let gpio = GpioActor::new().start();
+        let display = DisplayActor::new().start();
     }
 
     HttpServer::new(move || {
         App::new()
-            .data(relay.clone())
             .service(web::resource("/ws/").route(web::get().to(ws_index)))
             .route("/inputs", web::get().to(inputs))
+            .route("/output/{number}/{state}", web::post().to(output))
             .service(fs::Files::new("/", "static/").index_file("index.html"))
     })
         .bind("0.0.0.0:8080")?

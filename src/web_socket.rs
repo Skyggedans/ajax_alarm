@@ -7,33 +7,46 @@ use actix_web::{
 };
 use actix_web_actors::ws;
 use actix_web_actors::ws::WebsocketContext;
+use futures_util::task::SpawnExt;
 use serde_json::json;
 
 use crate::relay;
+use crate::relay::{RegisterForStatus, RelayActor, RelayStatus, UnregisterForStatus};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 
+
 pub struct ClientWebSocket {
+    pub id: usize,
     pub hb: Instant,
-    pub relay: Addr<relay::RelayActor>,
 }
 
 impl Actor for ClientWebSocket {
     type Context = ws::WebsocketContext<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
+        RelayActor::from_registry().send(RegisterForStatus(ctx.address().recipient()))
+            .into_actor(self)
+            .then(|res, act, ctx| {
+                match res {
+                    Ok(res) => act.id = res,
+                    _ => ctx.stop(),
+                }
+
+                fut::ready(())
+            })
+            .wait(ctx);
+
         self.hb(ctx);
     }
-}
 
-// impl Handler<RelayStatus> for ClientWebSocket {
-//     type Result = ();
-//
-//     fn handle(&mut self, msg: RelayStatus, ctx: &mut Self::Context) {
-//         ctx.text(msg.0);
-//     }
-// }
+    fn stopping(&mut self, _: &mut Self::Context) -> Running {
+        RelayActor::from_registry().do_send(UnregisterForStatus(self.id));
+
+        Running::Stop
+    }
+}
 
 impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for ClientWebSocket {
     fn handle(&mut self, msg: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
@@ -59,10 +72,10 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for ClientWebSocket {
 }
 
 impl ClientWebSocket {
-    pub fn new(relay: Addr<relay::RelayActor>) -> Self {
+    pub fn new() -> Self {
         Self {
+            id: 0,
             hb: Instant::now(),
-            relay,
         }
     }
 
@@ -76,21 +89,14 @@ impl ClientWebSocket {
             }
 
             ctx.ping(b"");
-
-            let res = act.relay.send(relay::GetInputs)
-                .into_actor(act)
-                .then(|res, _, ctx| {
-                    match res {
-                        Ok(inputs) => {
-                            ctx.text(json!(inputs).to_string());
-                        }
-                        Err(err) => {
-                            println!("Something is wrong");
-                        },
-                    }
-                    fut::ready(())
-                })
-                .spawn(ctx);
         });
+    }
+}
+
+impl Handler<RelayStatus> for ClientWebSocket {
+    type Result = ();
+
+    fn handle(&mut self, message: RelayStatus, ctx: &mut Self::Context) -> Self::Result {
+        ctx.text(json!(message).to_string());
     }
 }

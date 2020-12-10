@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -5,40 +6,51 @@ use actix::actors::resolver::{Connect, Resolver};
 use actix::io::{FramedWrite, WriteHandler};
 use actix::prelude::*;
 use actix::registry::SystemService;
+use actix::WeakAddr;
 use actix_web::web;
+use rand::prelude::*;
 use tokio::io::{split, WriteHalf};
 use tokio::net::TcpStream;
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
-use crate::web_socket::ClientWebSocket;
-use std::collections::HashMap;
+
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(serde::Serialize)]
-//#[derive(Message)]
 pub struct Inputs {
     pub number: usize,
-    pub states: Vec<u8>,
+    pub states: Vec<u32>,
     pub connected: bool,
 }
 
-//#[derive(Message)]
-//#[rtype(result = "Response")]
 pub struct GetInputs;
 
 impl Message for GetInputs {
     type Result = Inputs;
 }
 
-// #[derive(Message)]
-// #[rtype(usize)]
-// pub struct Subscribe {
-//     pub addr: Recipient<Inputs>,
-// }
-//
-// #[derive(Message)]
-// #[rtype(result = "()")]
-// pub struct Unsubscribe {
-//     pub id: usize,
-// }
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct SetOutput {
+    pub number: usize,
+    pub state: u32,
+}
+
+#[derive(serde::Serialize)]
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct RelayStatus {
+    pub inputs: Vec<u32>,
+    pub connected: bool,
+}
+
+#[derive(Message, Debug)]
+#[rtype(result = "usize")]
+pub struct RegisterForStatus(pub Recipient<RelayStatus>);
+
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct UnregisterForStatus(pub usize);
 
 type Framed = FramedWrite<
     String,
@@ -46,18 +58,32 @@ type Framed = FramedWrite<
     LinesCodec,
 >;
 
-#[derive(Default)]
 pub struct RelayActor {
     pub host: String,
     pub port: u16,
     pub inputs_number: usize,
-    states: Vec<u8>,
-    current_input: usize,
+    states: Vec<u32>,
     connected: bool,
     framed: Option<Framed>,
-    //sessions: HashMap<usize, Recipient<Inputs>>,
-    //pub inputs: web::Data<Mutex<Inputs>>,
-    //recipient: Recipient<RelayStatus>,
+    hb: Instant,
+    rng: ThreadRng,
+    clients: HashMap<usize, Recipient<RelayStatus>>,
+}
+
+impl Default for RelayActor {
+    fn default() -> Self {
+        RelayActor {
+            host: "".to_string(),
+            port: 12345,
+            inputs_number: 4,
+            states: vec![0u32; 4],
+            framed: None,
+            connected: false,
+            hb: Instant::now(),
+            rng: thread_rng(),
+            clients: HashMap::new(),
+        }
+    }
 }
 
 impl Actor for RelayActor {
@@ -75,12 +101,11 @@ impl Actor for RelayActor {
                         println!("RelayActor connected!");
 
                         let (r, w) = split(stream);
-
-                        ctx.add_stream(FramedRead::new(r, LinesCodec::new()));
-
                         let mut line_writer = actix::io::FramedWrite::new(w, LinesCodec::new(), ctx);
 
-                        line_writer.set_buffer_capacity(0, 10);
+                        ctx.add_stream(FramedRead::new(r, LinesCodec::new()));
+                        //line_writer.set_buffer_capacity(0, 10);
+                        line_writer.write("AT+OCMOD=1,100".to_string());
                         act.framed = Some(line_writer);
                         act.connected = true;
                     }
@@ -98,7 +123,7 @@ impl Actor for RelayActor {
             })
             .wait(ctx);
 
-        self.start_poll(ctx);
+        self.hb(ctx);
     }
 }
 
@@ -106,25 +131,18 @@ impl StreamHandler<Result<String, LinesCodecError>> for RelayActor {
     fn handle(&mut self, line: Result<String, LinesCodecError>, ctx: &mut Self::Context) {
         match line {
             Ok(line) => {
-                if line.starts_with("+OCCH") {
-                    let input_no = line
-                        .chars()
-                        .nth(5)
-                        .unwrap()
-                        .to_digit(10)
-                        .unwrap() as usize;
+                if line.starts_with("+OCCH_ALL") {
+                    let states_part = line.split_at(10).1;
 
-                    let input_state = line
-                        .chars()
-                        .nth(7)
-                        .unwrap()
-                        .to_digit(10)
-                        .unwrap() as u8;
+                    let states: Vec<u32> = states_part.split(',')
+                        .map(|c| c.chars().nth(0).unwrap().to_digit(10).unwrap()).collect();
 
-                    *&mut self.states[input_no - 1] = input_state;
+                    self.states = states;
                 }
 
-                println!("{}", line);
+                self.send_status();
+                self.hb = Instant::now();
+                //println!("{}", line);
             }
             Err(err) => {
                 println!("RelayActor error: {}", err);
@@ -135,30 +153,34 @@ impl StreamHandler<Result<String, LinesCodecError>> for RelayActor {
 }
 
 impl RelayActor {
-    pub fn new(host: String, port: u16, inputs_number: usize) -> RelayActor {
-        RelayActor {
+    pub fn new(host: String, port: u16, inputs_number: usize) -> Self {
+        Self {
             host,
             port,
             inputs_number,
-            current_input: 0,
-            states: vec![0u8; inputs_number],
-            framed: None,
-            connected: false,
-            //sessions: HashMap::new(),
+            ..RelayActor::default()
         }
     }
 
-    fn start_poll(&self, ctx: &mut <Self as Actor>::Context) {
-        ctx.run_interval(Duration::from_millis(200), |act, ctx| {
-            if let Some(framed) = act.framed.as_mut() {
-                if act.current_input < act.inputs_number {
-                    act.current_input += 1;
-                    framed.write(format!("AT+OCCH{}=?", act.current_input));
-                } else {
-                    act.current_input = 0;
-                }
-            };
+    fn hb(&self, ctx: &mut <Self as Actor>::Context) {
+        ctx.run_interval(HEARTBEAT_INTERVAL, |act, ctx| {
+            if Instant::now().duration_since(act.hb) > HEARTBEAT_TIMEOUT {
+                act.connected = false;
+
+                ctx.run_later(Duration::from_secs(5), |_, ctx| {
+                    println!("Relay heartbeat failed, disconnecting!");
+                    ctx.stop();
+                });
+            }
         });
+    }
+
+    fn send_status(&self) {
+        for (id, addr) in &self.clients {
+            let message = RelayStatus { inputs: self.states.clone(), connected: self.connected };
+
+            addr.do_send(message).unwrap();
+        }
     }
 }
 
@@ -172,7 +194,7 @@ impl Supervised for RelayActor {
 
 impl SystemService for RelayActor {
     fn service_started(&mut self, ctx: &mut Context<Self>) {
-        println!("WebSocket started");
+        println!("RelayActor started");
     }
 }
 
@@ -188,22 +210,36 @@ impl Handler<GetInputs> for RelayActor {
     }
 }
 
-// impl Handler<Subscribe> for RelayActor {
-//     type Result = usize;
-//
-//     fn handle(&mut self, msg: Subscribe, _: &mut Context<Self>) -> Self::Result {
-//         let id = self.rng.gen::<usize>();
-//         self.sessions.insert(id, msg.addr);
-//
-//         id
-//     }
-// }
-//
-// impl Handler<Unsubscribe> for RelayActor {
-//     type Result = ();
-//
-//     fn handle(&mut self, msg: Unsubscribe, _: &mut Context<Self>) {
-//         if self.sessions.remove(&msg.id).is_some() {
-//         }
-//     }
-// }
+impl Handler<SetOutput> for RelayActor {
+    type Result = ();
+
+    fn handle(&mut self, message: SetOutput, _: &mut Context<Self>) -> Self::Result {
+        if let Some(ref mut line_writer) = self.framed {
+            line_writer.write(format!("AT+STACH{}={}", message.number, message.state));
+        }
+    }
+}
+
+impl Handler<RegisterForStatus> for RelayActor {
+    type Result = usize;
+
+    fn handle(
+        &mut self,
+        RegisterForStatus(client): RegisterForStatus,
+        _ctx: &mut Self::Context,
+    ) -> Self::Result {
+        let id = self.rng.gen::<usize>();
+
+        self.clients.insert(id, client);
+
+        id
+    }
+}
+
+impl Handler<UnregisterForStatus> for RelayActor {
+    type Result = ();
+
+    fn handle(&mut self, UnregisterForStatus(id): UnregisterForStatus, _ctx: &mut Context<Self>) {
+        self.clients.remove(&id);
+    }
+}
