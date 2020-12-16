@@ -1,6 +1,8 @@
-use std::collections::HashMap;
+use std::any::Any;
+use std::borrow::BorrowMut;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use actix::actors::resolver::{Connect, Resolver};
 use actix::io::{FramedWrite, WriteHandler};
@@ -11,16 +13,29 @@ use actix_web::web;
 use rand::prelude::*;
 use tokio::io::{split, WriteHalf};
 use tokio::net::TcpStream;
+use tokio::sync::oneshot;
+use tokio::sync::oneshot::{channel, Receiver, Sender};
+use tokio::time::{self, Duration, timeout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+const STACH_PATTERN: &str = "+STACH";
+const TIME_PATTERN: &str = "+TIME";
+const TIMESW_PATTERN: &str = "+TIMESW";
 
 #[derive(serde::Serialize)]
 pub struct Inputs {
     pub number: usize,
     pub states: Vec<u32>,
     pub connected: bool,
+}
+
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct SetSystemTime {
+    pub date_time: String,
+    pub day_of_week: u8,
 }
 
 pub struct GetInputs;
@@ -30,10 +45,41 @@ impl Message for GetInputs {
 }
 
 #[derive(Message)]
+#[rtype(result = "u32")]
+pub struct GetOutput {
+    pub number: usize,
+}
+
+#[derive(Message)]
 #[rtype(result = "()")]
 pub struct SetOutput {
     pub number: usize,
     pub state: u32,
+}
+
+// pub enum OutputScheduleMode {
+//     DeleteAllDaily,
+//     AddQueryDaily,
+//     DeleteAllCustom,
+//     AddQueryCustom,
+// }
+//
+// impl OutputScheduleMode {
+//     fn value(&self) -> i32 {
+//         match *self {
+//             OutputScheduleMode::DeleteAllDaily => 0,
+//             OutputScheduleMode::AddQueryDaily => 1,
+//             OutputScheduleMode::DeleteAllCustom => 2,
+//             OutputScheduleMode::AddQueryCustom => 3,
+//         }
+//     }
+// }
+
+#[derive(Message)]
+#[rtype(result = "String")]
+pub struct GetOutputSchedule {
+    pub number: usize,
+    pub mode: u8,
 }
 
 #[derive(serde::Serialize)]
@@ -62,12 +108,15 @@ pub struct RelayActor {
     pub host: String,
     pub port: u16,
     pub inputs_number: usize,
-    states: Vec<u32>,
+    pub outputs_number: usize,
+    inputs: Vec<u32>,
+    inputs_mask: u32,
     connected: bool,
     framed: Option<Framed>,
     hb: Instant,
     rng: ThreadRng,
     clients: HashMap<usize, Recipient<RelayStatus>>,
+    oneshots: HashMap<String, VecDeque<Sender<Box<dyn Any>>>>,
 }
 
 impl Default for RelayActor {
@@ -76,12 +125,15 @@ impl Default for RelayActor {
             host: "".to_string(),
             port: 12345,
             inputs_number: 4,
-            states: vec![0u32; 4],
+            outputs_number: 4,
+            inputs: vec![0u32; 4],
+            inputs_mask: 0xff,
             framed: None,
             connected: false,
             hb: Instant::now(),
             rng: thread_rng(),
             clients: HashMap::new(),
+            oneshots: HashMap::new(),
         }
     }
 }
@@ -96,7 +148,7 @@ impl Actor for RelayActor {
             .send(Connect::host_and_port(self.host.as_str(), self.port))
             .into_actor(self)
             .map(|res, act, ctx| match res {
-                Ok(res2) => match res2 {
+                Ok(res) => match res {
                     Ok(stream) => {
                         println!("RelayActor connected!");
 
@@ -104,7 +156,6 @@ impl Actor for RelayActor {
                         let mut line_writer = actix::io::FramedWrite::new(w, LinesCodec::new(), ctx);
 
                         ctx.add_stream(FramedRead::new(r, LinesCodec::new()));
-                        //line_writer.set_buffer_capacity(0, 10);
                         line_writer.write("AT+OCMOD=1,100".to_string());
                         act.framed = Some(line_writer);
                         act.connected = true;
@@ -131,18 +182,76 @@ impl StreamHandler<Result<String, LinesCodecError>> for RelayActor {
     fn handle(&mut self, line: Result<String, LinesCodecError>, ctx: &mut Self::Context) {
         match line {
             Ok(line) => {
+                println!("{}", line);
+
                 if line.starts_with("+OCCH_ALL") {
                     let states_part = line.split_at(10).1;
 
                     let states: Vec<u32> = states_part.split(',')
                         .map(|c| c.chars().nth(0).unwrap().to_digit(10).unwrap()).collect();
 
-                    self.states = states;
+                    let mut states_for_mask = states.clone();
+                    let mut states_mask = 0;
+
+                    states_for_mask.reverse();
+
+                    for input in states_for_mask.iter() {
+                        states_mask <<= 1;
+                        states_mask += input;
+                    }
+
+                    if states_mask != self.inputs_mask {
+                        self.inputs_mask = states_mask;
+                        self.inputs = states;
+                        self.send_status();
+                    }
+                } else if line.starts_with(STACH_PATTERN) {
+                    let output_no = line
+                        .chars()
+                        .nth(6)
+                        .unwrap()
+                        .to_digit(10)
+                        .unwrap() as usize;
+
+                    let output_state = line
+                        .chars()
+                        .nth(8)
+                        .unwrap()
+                        .to_digit(10)
+                        .unwrap() as u32;
+
+                    let key = format!("{}{}", STACH_PATTERN, output_no);
+
+                    if let Some(vec) = self.oneshots.get_mut(key.as_str()) {
+                        if let Some(sender) = vec.pop_front() {
+                            sender.send(Box::new(output_state)).unwrap();
+                        }
+                    }
+                } else if line.starts_with(TIMESW_PATTERN) {
+                    let output_no = line
+                        .chars()
+                        .nth(8)
+                        .unwrap()
+                        .to_digit(10)
+                        .unwrap() as usize;
+
+                    let output_mod = line
+                        .chars()
+                        .nth(10)
+                        .unwrap()
+                        .to_digit(10)
+                        .unwrap() as u32;
+
+                    let key = format!("{}:{},{}", TIMESW_PATTERN, output_no, output_mod);
+
+                    if let Some(vec) = self.oneshots.get_mut(key.as_str()) {
+                        if let Some(sender) = vec.pop_front() {
+                            sender.send(Box::new(line)).unwrap();
+                        }
+                    }
                 }
 
-                self.send_status();
                 self.hb = Instant::now();
-                //println!("{}", line);
             }
             Err(err) => {
                 println!("RelayActor error: {}", err);
@@ -153,11 +262,13 @@ impl StreamHandler<Result<String, LinesCodecError>> for RelayActor {
 }
 
 impl RelayActor {
-    pub fn new(host: String, port: u16, inputs_number: usize) -> Self {
+    pub fn new(host: String, port: u16, inputs_number: usize, outputs_number: usize) -> Self {
         Self {
             host,
             port,
             inputs_number,
+            outputs_number,
+            inputs: vec![0u32; inputs_number],
             ..RelayActor::default()
         }
     }
@@ -177,9 +288,20 @@ impl RelayActor {
 
     fn send_status(&self) {
         for (id, addr) in &self.clients {
-            let message = RelayStatus { inputs: self.states.clone(), connected: self.connected };
+            let message = RelayStatus { inputs: self.inputs.clone(), connected: self.connected };
 
             addr.do_send(message).unwrap();
+        }
+    }
+
+    fn enqueue_oneshot_for_command(&mut self, key: String, sender: Sender<Box<dyn Any>>) {
+        if let Some(vec) = self.oneshots.get_mut(key.as_str()) {
+            vec.push_back(sender);
+        } else {
+            let mut deque = VecDeque::new();
+
+            deque.push_back(sender);
+            self.oneshots.insert(key, deque);
         }
     }
 }
@@ -198,14 +320,74 @@ impl SystemService for RelayActor {
     }
 }
 
+impl Handler<SetSystemTime> for RelayActor {
+    type Result = ();
+
+    fn handle(&mut self, message: SetSystemTime, _: &mut Context<Self>) -> Self::Result {
+        if let Some(ref mut line_writer) = self.framed {
+            line_writer.write(format!("AT{}={} {}", TIME_PATTERN, message.date_time, message.day_of_week));
+        }
+    }
+}
+
 impl Handler<GetInputs> for RelayActor {
     type Result = MessageResult<GetInputs>;
 
     fn handle(&mut self, _: GetInputs, _: &mut Context<Self>) -> Self::Result {
         MessageResult(Inputs {
             number: self.inputs_number,
-            states: self.states.clone(),
+            states: self.inputs.clone(),
             connected: self.connected,
+        })
+    }
+}
+
+impl Handler<GetOutput> for RelayActor {
+    type Result = ResponseFuture<u32>;
+
+    fn handle(&mut self, message: GetOutput, _: &mut Context<Self>) -> Self::Result {
+        if let Some(ref mut line_writer) = self.framed {
+            line_writer.write(format!("AT{}{}=?", STACH_PATTERN, message.number));
+        }
+
+        let key = format!("{}{}", STACH_PATTERN, message.number);
+        let (sender, receiver) = channel();
+
+        self.enqueue_oneshot_for_command(key, sender);
+
+        Box::pin(async move {
+            let res = time::timeout(Duration::from_secs(10), receiver).await;
+
+            if let Ok(Ok(state)) = res {
+                *state.downcast::<u32>().unwrap()
+            } else {
+                0
+            }
+        })
+    }
+}
+
+impl Handler<GetOutputSchedule> for RelayActor {
+    type Result = ResponseFuture<String>;
+
+    fn handle(&mut self, message: GetOutputSchedule, _: &mut Context<Self>) -> Self::Result {
+        if let Some(ref mut line_writer) = self.framed {
+            line_writer.write(format!("AT{}={},{}?", TIMESW_PATTERN, message.number, message.mode));
+        }
+
+        let key = format!("{}:{},{}", TIMESW_PATTERN, message.number, message.mode);
+        let (sender, receiver) = channel();
+
+        self.enqueue_oneshot_for_command(key, sender);
+
+        Box::pin(async move {
+            let res = time::timeout(Duration::from_secs(10), receiver).await;
+
+            if let Ok(Ok(state)) = res {
+                *state.downcast::<String>().unwrap()
+            } else {
+                String::new()
+            }
         })
     }
 }
@@ -215,7 +397,7 @@ impl Handler<SetOutput> for RelayActor {
 
     fn handle(&mut self, message: SetOutput, _: &mut Context<Self>) -> Self::Result {
         if let Some(ref mut line_writer) = self.framed {
-            line_writer.write(format!("AT+STACH{}={}", message.number, message.state));
+            line_writer.write(format!("AT{}{}={}", STACH_PATTERN, message.number, message.state));
         }
     }
 }
@@ -231,6 +413,7 @@ impl Handler<RegisterForStatus> for RelayActor {
         let id = self.rng.gen::<usize>();
 
         self.clients.insert(id, client);
+        self.send_status();
 
         id
     }

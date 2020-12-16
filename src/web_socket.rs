@@ -11,7 +11,7 @@ use futures_util::task::SpawnExt;
 use serde_json::json;
 
 use crate::relay;
-use crate::relay::{RegisterForStatus, RelayActor, RelayStatus, UnregisterForStatus};
+use crate::relay::{RegisterForStatus, RelayActor, RelayStatus, UnregisterForStatus, GetInputs};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
