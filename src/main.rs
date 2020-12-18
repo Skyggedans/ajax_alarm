@@ -21,7 +21,7 @@ use serde_json::json;
 use crate::display::DisplayActor;
 #[cfg(target_os = "linux")]
 use crate::gpio::GpioActor;
-use crate::relay::{GetInputs, GetOutput, GetOutputSchedule, RegisterForStatus, RelayActor, SetOutput};
+use crate::relay::{GetInputs, GetOutput, GetOutputSchedule, GetSystemTime, RegisterForStatus, RelayActor, SetOutput, SetSystemTime, SystemTime};
 use crate::web_socket::ClientWebSocket;
 
 mod relay;
@@ -126,42 +126,64 @@ async fn ws_index(
     ws::start(ClientWebSocket::new(), &r, stream)
 }
 
+async fn get_system_time() -> HttpResponse {
+    let res = RelayActor::from_registry().send(GetSystemTime {}).await;
+
+    if let Ok(Ok(res)) = res {
+        HttpResponse::Ok()
+            .content_type("application/json")
+            .body(json!(res))
+    } else {
+        HttpResponse::NoContent().finish()
+    }
+}
+
+async fn set_system_time(json: web::Json<SystemTime>) -> HttpResponse {
+    let res = RelayActor::from_registry().do_send(SetSystemTime { time: json.0 });
+
+    HttpResponse::Ok().finish()
+}
+
 async fn inputs() -> HttpResponse {
     let res = RelayActor::from_registry().send(GetInputs).await;
 
-    match res {
-        Ok(inputs) => {
-            HttpResponse::Ok()
-                .content_type("application/json")
-                .body(json!({
-                "number": inputs.number,
-                "states": inputs.states
-            }))
-        }
-        Err(_) => HttpResponse::NoContent().finish()
+    if let Ok(res) = res {
+        HttpResponse::Ok()
+            .content_type("application/json")
+            .body(json!(res))
+    } else {
+        HttpResponse::NoContent().finish()
     }
 }
 
 async fn get_output(web::Path(number): web::Path<usize>) -> HttpResponse {
-    let state = RelayActor::from_registry().send(GetOutput { number }).await.unwrap();
+    let res = RelayActor::from_registry().send(GetOutput { number }).await;
 
-    HttpResponse::Ok()
-        .content_type("application/json")
-        .body(json!(state))
+    if let Ok(Ok(res)) = res {
+        HttpResponse::Ok()
+            .content_type("application/json")
+            .body(json!(res))
+    } else {
+        HttpResponse::NoContent().finish()
+    }
 }
 
-async fn post_output(web::Path((number, state)): web::Path<(usize, u32)>) -> HttpResponse {
+async fn set_output(web::Path((number, state)): web::Path<(usize, u32)>) -> HttpResponse {
     let res = RelayActor::from_registry().do_send(SetOutput { number, state });
 
     HttpResponse::Ok().finish()
 }
 
 async fn get_output_schedule(web::Path((number, mode)): web::Path<(usize, u8)>) -> HttpResponse {
-    let state = RelayActor::from_registry().send(GetOutputSchedule { number, mode }).await.unwrap();
+    let res = RelayActor::from_registry().send(GetOutputSchedule { number, mode }).await;
 
-    HttpResponse::Ok()
-        .content_type("application/json")
-        .body(json!(state))
+    if let Ok(Ok(res)) = res {
+        HttpResponse::Ok()
+            .content_type("application/json")
+            .body(json!(res))
+    } else {
+        HttpResponse::NoContent().finish()
+    }
 }
 
 #[actix_web::main]
@@ -180,9 +202,11 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .service(web::resource("/ws/").route(web::get().to(ws_index)))
+            .route("/system_time", web::get().to(get_system_time))
+            .route("/system_time", web::post().to(set_system_time))
             .route("/inputs", web::get().to(inputs))
             .route("/output/{number}", web::get().to(get_output))
-            .route("/output/{number}/{state}", web::post().to(post_output))
+            .route("/output/{number}/{state}", web::post().to(set_output))
             .route("/output/{number}/schedule/{mode}", web::get().to(get_output_schedule))
             .service(fs::Files::new("/", "static/").index_file("index.html"))
     })
