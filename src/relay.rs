@@ -8,7 +8,6 @@ use actix::actors::resolver::{Connect, Resolver};
 use actix::io::{FramedWrite, WriteHandler};
 use actix::prelude::*;
 use actix::registry::SystemService;
-use actix::WeakAddr;
 use actix_web::web;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -41,6 +40,18 @@ pub struct SystemTime {
     pub day_of_week: u8,
 }
 
+#[derive(Deserialize, Serialize)]
+pub struct DailyEvent {
+    pub time: String,
+    pub state: u32,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct CustomEvent {
+    pub date_time: String,
+    pub state: u32,
+}
+
 #[derive(Message)]
 #[rtype(result = "Result<SystemTime, ()>")]
 pub struct GetSystemTime;
@@ -71,10 +82,41 @@ pub struct SetOutput {
 }
 
 #[derive(Message)]
-#[rtype(result = "Result<String, ()>")]
-pub struct GetOutputSchedule {
+#[rtype(result = "Result<Vec<DailyEvent>, ()>")]
+pub struct GetOutputDailySchedule {
     pub number: usize,
-    pub mode: u8,
+}
+
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct SetOutputDailySchedule {
+    pub number: usize,
+    pub event: DailyEvent,
+}
+
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct ClearOutputDailySchedule {
+    pub number: usize,
+}
+
+#[derive(Message)]
+#[rtype(result = "Result<Vec<CustomEvent>, ()>")]
+pub struct GetOutputCustomSchedule {
+    pub number: usize,
+}
+
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct SetOutputCustomSchedule {
+    pub number: usize,
+    pub event: CustomEvent,
+}
+
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct ClearOutputCustomSchedule {
+    pub number: usize,
 }
 
 #[derive(serde::Serialize)]
@@ -139,6 +181,8 @@ impl Actor for RelayActor {
     fn started(&mut self, ctx: &mut Self::Context) {
         println!("RelayActor started!");
 
+        self.oneshots = HashMap::new();
+
         Resolver::from_registry()
             .send(Connect::host_and_port(self.host.as_str(), self.port))
             .into_actor(self)
@@ -177,76 +221,16 @@ impl StreamHandler<Result<String, LinesCodecError>> for RelayActor {
     fn handle(&mut self, line: Result<String, LinesCodecError>, ctx: &mut Self::Context) {
         match line {
             Ok(line) => {
-                println!("{}", line);
+                // println!("{}", line);
 
-                if line.starts_with(TIME_PATTERN) {
-                    let value = line.split_at(6).1; // Split on semicolon
-                    let (date_time, day_of_week) = value.split_at(20); // Split on last space
-                    let key = format!("{}", TIME_PATTERN);
-
-                    let time = SystemTime {
-                        date_time: date_time.trim().to_string(),
-                        day_of_week: day_of_week.parse::<u8>().unwrap(),
-                    };
-
-                    self.fire_oneshot(key, time);
+                if line.starts_with(TIMESW_PATTERN) {
+                    self.handle_timesw(line);
+                } else if line.starts_with(TIME_PATTERN) {
+                    self.handle_time(line);
                 } else if line.starts_with(OCCH_ALL_PATTERN) {
-                    let states_part = line.split_at(10).1;
-
-                    let states: Vec<u32> = states_part.split(',')
-                        .map(|c| c.chars().nth(0).unwrap().to_digit(10).unwrap()).collect();
-
-                    let mut states_for_mask = states.clone();
-                    let mut states_mask = 0;
-
-                    states_for_mask.reverse();
-
-                    for input in states_for_mask.iter() {
-                        states_mask <<= 1;
-                        states_mask += input;
-                    }
-
-                    if states_mask != self.inputs_mask {
-                        self.inputs_mask = states_mask;
-                        self.inputs = states;
-                        self.send_status();
-                    }
+                    self.handle_occh_all(line);
                 } else if line.starts_with(STACH_PATTERN) {
-                    let output_no = line
-                        .chars()
-                        .nth(6)
-                        .unwrap()
-                        .to_digit(10)
-                        .unwrap() as usize;
-
-                    let output_state = line
-                        .chars()
-                        .nth(8)
-                        .unwrap()
-                        .to_digit(10)
-                        .unwrap() as u32;
-
-                    let key = format!("{}{}", STACH_PATTERN, output_no);
-
-                    self.fire_oneshot(key, output_state);
-                } else if line.starts_with(TIMESW_PATTERN) {
-                    let output_no = line
-                        .chars()
-                        .nth(8)
-                        .unwrap()
-                        .to_digit(10)
-                        .unwrap() as usize;
-
-                    let output_mod = line
-                        .chars()
-                        .nth(10)
-                        .unwrap()
-                        .to_digit(10)
-                        .unwrap() as u32;
-
-                    let key = format!("{}:{},{}", TIMESW_PATTERN, output_no, output_mod);
-
-                    self.fire_oneshot(key, line);
+                    self.handle_stach(line);
                 }
 
                 self.hb = Instant::now();
@@ -292,7 +276,7 @@ impl RelayActor {
         }
     }
 
-    fn enqueue_oneshot<T: 'static>(&mut self, key: String) -> Pin<Box<impl Future<Output = Result<T, ()>>>> {
+    fn enqueue_oneshot<T: 'static>(&mut self, key: String) -> Pin<Box<impl Future<Output=Result<T, ()>>>> {
         let (sender, receiver) = channel();
 
         if let Some(vec) = self.oneshots.get_mut(key.as_str()) {
@@ -318,9 +302,116 @@ impl RelayActor {
     fn fire_oneshot<T: 'static>(&mut self, key: String, value: T) {
         if let Some(vec) = self.oneshots.get_mut(key.as_str()) {
             if let Some(sender) = vec.pop_front() {
-                sender.send(Box::new(value)).unwrap();
+                sender.send(Box::new(value)).unwrap_or_else(|err| {
+                    println!("Unable to fire oneshot");
+                });
             }
         }
+    }
+
+    fn handle_time(&mut self, line: String) {
+        let value = line.split_at(6).1; // Split on semicolon
+        let (date_time, day_of_week) = value.split_at(20); // Split on last space
+        let key = format!("{}", TIME_PATTERN);
+
+        let time = SystemTime {
+            date_time: date_time.trim().to_string(),
+            day_of_week: day_of_week.parse::<u8>().unwrap(),
+        };
+
+        self.fire_oneshot(key, time);
+    }
+
+    fn handle_timesw(&mut self, line: String) {
+        let output_no = line
+            .chars()
+            .nth(8)
+            .unwrap()
+            .to_digit(10)
+            .unwrap() as usize;
+
+        let mode = line
+            .chars()
+            .nth(10)
+            .unwrap()
+            .to_digit(10)
+            .unwrap() as u32;
+
+        let split = line.rsplit(',');
+        let key = format!("{}:{},{}", TIMESW_PATTERN, output_no, mode);
+
+        let res = match mode {
+            1 => {
+                let mut events = split.filter(|item| item.len() == 10).map(|item| {
+                    let (time, state) = item.split_at(9);
+
+                    DailyEvent {
+                        time: time.trim().to_string(),
+                        state: state.parse::<u32>().unwrap(),
+                    }
+                }).collect::<Vec<DailyEvent>>();
+
+                events.reverse();
+                self.fire_oneshot(key, events);
+            }
+            3 => {
+                let mut events = split.filter(|item| item.len() == 21).map(|item| {
+                    let (date_time, state) = item.split_at(20);
+
+                    CustomEvent {
+                        date_time: date_time.trim().to_string(),
+                        state: state.parse::<u32>().unwrap(),
+                    }
+                }).collect::<Vec<CustomEvent>>();
+
+                events.reverse();
+                self.fire_oneshot(key, events);
+            }
+            _ => ()
+        };
+    }
+
+    fn handle_occh_all(&mut self, line: String) {
+        let states_part = line.split_at(10).1;
+
+        let states: Vec<u32> = states_part.split(',')
+            .map(|c| c.chars().nth(0).unwrap().to_digit(10).unwrap()).collect();
+
+        let mut states_for_mask = states.clone();
+        let mut states_mask = 0;
+
+        states_for_mask.reverse();
+
+        for input in states_for_mask.iter() {
+            states_mask <<= 1;
+            states_mask += input;
+        }
+
+        if states_mask != self.inputs_mask {
+            self.inputs_mask = states_mask;
+            self.inputs = states;
+            self.send_status();
+        }
+    }
+
+    fn handle_stach(&mut self, line: String) {
+        let output_no = line
+            .chars()
+            .nth(6)
+            .unwrap()
+            .to_digit(10)
+            .unwrap() as usize;
+
+        let output_state = line
+            .chars()
+            .nth(8)
+            .unwrap()
+            .to_digit(10)
+            .unwrap() as u32;
+
+        let key = format!("{}{}", STACH_PATTERN, output_no);
+
+        self.fire_oneshot(key, output_state);
     }
 }
 
@@ -388,17 +479,73 @@ impl Handler<GetOutput> for RelayActor {
     }
 }
 
-impl Handler<GetOutputSchedule> for RelayActor {
-    type Result = ResponseFuture<Result<String, ()>>;
+impl Handler<GetOutputDailySchedule> for RelayActor {
+    type Result = ResponseFuture<Result<Vec<DailyEvent>, ()>>;
 
-    fn handle(&mut self, message: GetOutputSchedule, _: &mut Context<Self>) -> Self::Result {
+    fn handle(&mut self, message: GetOutputDailySchedule, _: &mut Context<Self>) -> Self::Result {
         if let Some(ref mut line_writer) = self.framed {
-            line_writer.write(format!("AT{}={},{}?", TIMESW_PATTERN, message.number, message.mode));
+            line_writer.write(format!("AT{}={},1?", TIMESW_PATTERN, message.number));
         }
 
-        let key = format!("{}:{},{}", TIMESW_PATTERN, message.number, message.mode);
+        let key = format!("{}:{},1", TIMESW_PATTERN, message.number);
 
         self.enqueue_oneshot(key)
+    }
+}
+
+impl Handler<SetOutputDailySchedule> for RelayActor {
+    type Result = ();
+
+    fn handle(&mut self, message: SetOutputDailySchedule, _: &mut Context<Self>) -> Self::Result {
+        if let Some(ref mut line_writer) = self.framed {
+            line_writer.write(format!("AT{}={},1,{} {}", TIMESW_PATTERN, message.number,
+                                      message.event.time, message.event.state));
+        }
+    }
+}
+
+impl Handler<ClearOutputDailySchedule> for RelayActor {
+    type Result = ();
+
+    fn handle(&mut self, message: ClearOutputDailySchedule, _: &mut Context<Self>) -> Self::Result {
+        if let Some(ref mut line_writer) = self.framed {
+            line_writer.write(format!("AT{}={},0", TIMESW_PATTERN, message.number));
+        }
+    }
+}
+
+impl Handler<GetOutputCustomSchedule> for RelayActor {
+    type Result = ResponseFuture<Result<Vec<CustomEvent>, ()>>;
+
+    fn handle(&mut self, message: GetOutputCustomSchedule, _: &mut Context<Self>) -> Self::Result {
+        if let Some(ref mut line_writer) = self.framed {
+            line_writer.write(format!("AT{}={},3?", TIMESW_PATTERN, message.number));
+        }
+
+        let key = format!("{}:{},3", TIMESW_PATTERN, message.number);
+
+        self.enqueue_oneshot(key)
+    }
+}
+
+impl Handler<SetOutputCustomSchedule> for RelayActor {
+    type Result = ();
+
+    fn handle(&mut self, message: SetOutputCustomSchedule, _: &mut Context<Self>) -> Self::Result {
+        if let Some(ref mut line_writer) = self.framed {
+            line_writer.write(format!("AT{}={},3,{} {}", TIMESW_PATTERN, message.number,
+                                      message.event.date_time, message.event.state));
+        }
+    }
+}
+
+impl Handler<ClearOutputCustomSchedule> for RelayActor {
+    type Result = ();
+
+    fn handle(&mut self, message: ClearOutputCustomSchedule, _: &mut Context<Self>) -> Self::Result {
+        if let Some(ref mut line_writer) = self.framed {
+            line_writer.write(format!("AT{}={},2", TIMESW_PATTERN, message.number));
+        }
     }
 }
 

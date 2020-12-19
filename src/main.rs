@@ -21,7 +21,7 @@ use serde_json::json;
 use crate::display::DisplayActor;
 #[cfg(target_os = "linux")]
 use crate::gpio::GpioActor;
-use crate::relay::{GetInputs, GetOutput, GetOutputSchedule, GetSystemTime, RegisterForStatus, RelayActor, SetOutput, SetSystemTime, SystemTime};
+use crate::relay::{GetInputs, GetOutput, GetOutputDailySchedule, GetSystemTime, RegisterForStatus, RelayActor, SetOutput, SetSystemTime, SystemTime, GetOutputCustomSchedule, DailyEvent, CustomEvent, SetOutputCustomSchedule, SetOutputDailySchedule, ClearOutputDailySchedule, ClearOutputCustomSchedule};
 use crate::web_socket::ClientWebSocket;
 
 mod relay;
@@ -127,7 +127,8 @@ async fn ws_index(
 }
 
 async fn get_system_time() -> HttpResponse {
-    let res = RelayActor::from_registry().send(GetSystemTime {}).await;
+    let res = RelayActor::from_registry()
+        .send(GetSystemTime {}).await;
 
     if let Ok(Ok(res)) = res {
         HttpResponse::Ok()
@@ -138,14 +139,15 @@ async fn get_system_time() -> HttpResponse {
     }
 }
 
-async fn set_system_time(json: web::Json<SystemTime>) -> HttpResponse {
-    let res = RelayActor::from_registry().do_send(SetSystemTime { time: json.0 });
+async fn set_system_time(web::Json(time): web::Json<SystemTime>) -> HttpResponse {
+    let res = RelayActor::from_registry().do_send(SetSystemTime { time });
 
     HttpResponse::Ok().finish()
 }
 
 async fn inputs() -> HttpResponse {
-    let res = RelayActor::from_registry().send(GetInputs).await;
+    let res = RelayActor::from_registry()
+        .send(GetInputs).await;
 
     if let Ok(res) = res {
         HttpResponse::Ok()
@@ -157,7 +159,8 @@ async fn inputs() -> HttpResponse {
 }
 
 async fn get_output(web::Path(number): web::Path<usize>) -> HttpResponse {
-    let res = RelayActor::from_registry().send(GetOutput { number }).await;
+    let res = RelayActor::from_registry()
+        .send(GetOutput { number }).await;
 
     if let Ok(Ok(res)) = res {
         HttpResponse::Ok()
@@ -174,8 +177,9 @@ async fn set_output(web::Path((number, state)): web::Path<(usize, u32)>) -> Http
     HttpResponse::Ok().finish()
 }
 
-async fn get_output_schedule(web::Path((number, mode)): web::Path<(usize, u8)>) -> HttpResponse {
-    let res = RelayActor::from_registry().send(GetOutputSchedule { number, mode }).await;
+async fn get_output_daily_schedule(web::Path(number): web::Path<usize>) -> HttpResponse {
+    let res = RelayActor::from_registry()
+        .send(GetOutputDailySchedule { number }).await;
 
     if let Ok(Ok(res)) = res {
         HttpResponse::Ok()
@@ -184,6 +188,43 @@ async fn get_output_schedule(web::Path((number, mode)): web::Path<(usize, u8)>) 
     } else {
         HttpResponse::NoContent().finish()
     }
+}
+
+async fn set_output_daily_schedule(web::Path(number): web::Path<usize>, web::Json(event): web::Json<DailyEvent>) -> HttpResponse {
+    let res = RelayActor::from_registry().do_send(SetOutputDailySchedule { number, event });
+
+    HttpResponse::Ok().finish()
+}
+
+async fn clear_output_daily_schedule(web::Path(number): web::Path<usize>) -> HttpResponse {
+    let res = RelayActor::from_registry().do_send(ClearOutputDailySchedule { number });
+
+    HttpResponse::Ok().finish()
+}
+
+async fn get_output_custom_schedule(web::Path(number): web::Path<usize>) -> HttpResponse {
+    let res = RelayActor::from_registry()
+        .send(GetOutputCustomSchedule { number }).await;
+
+    if let Ok(Ok(res)) = res {
+        HttpResponse::Ok()
+            .content_type("application/json")
+            .body(json!(res))
+    } else {
+        HttpResponse::NoContent().finish()
+    }
+}
+
+async fn set_output_custom_schedule(web::Path(number): web::Path<usize>, web::Json(event): web::Json<CustomEvent>) -> HttpResponse {
+    let res = RelayActor::from_registry().do_send(SetOutputCustomSchedule { number, event });
+
+    HttpResponse::Ok().finish()
+}
+
+async fn clear_output_custom_schedule(web::Path(number): web::Path<usize>) -> HttpResponse {
+    let res = RelayActor::from_registry().do_send(ClearOutputCustomSchedule { number });
+
+    HttpResponse::Ok().finish()
 }
 
 #[actix_web::main]
@@ -207,7 +248,12 @@ async fn main() -> std::io::Result<()> {
             .route("/inputs", web::get().to(inputs))
             .route("/output/{number}", web::get().to(get_output))
             .route("/output/{number}/{state}", web::post().to(set_output))
-            .route("/output/{number}/schedule/{mode}", web::get().to(get_output_schedule))
+            .route("/output/{number}/daily_schedule", web::get().to(get_output_daily_schedule))
+            .route("/output/{number}/daily_schedule", web::put().to(set_output_daily_schedule))
+            .route("/output/{number}/daily_schedule", web::delete().to(clear_output_daily_schedule))
+            .route("/output/{number}/custom_schedule", web::get().to(get_output_custom_schedule))
+            .route("/output/{number}/custom_schedule", web::put().to(set_output_custom_schedule))
+            .route("/output/{number}/custom_schedule", web::delete().to(clear_output_custom_schedule))
             .service(fs::Files::new("/", "static/").index_file("index.html"))
     })
         .bind("0.0.0.0:8080")?
