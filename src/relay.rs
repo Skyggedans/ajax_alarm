@@ -18,6 +18,7 @@ use tokio::sync::oneshot::{channel, Receiver, Sender};
 use tokio::time::{self, Duration, timeout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 use tokio::macros::support::Pin;
+use actix::dev::MessageResponse;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -26,13 +27,6 @@ const STACH_PATTERN: &str = "+STACH";
 const TIME_PATTERN: &str = "+TIME";
 const TIMESW_PATTERN: &str = "+TIMESW";
 
-#[derive(Serialize)]
-#[derive(MessageResponse)]
-pub struct Inputs {
-    pub number: usize,
-    pub states: Vec<u32>,
-    pub connected: bool,
-}
 
 #[derive(Deserialize, Serialize)]
 pub struct SystemTime {
@@ -62,11 +56,9 @@ pub struct SetSystemTime {
     pub time: SystemTime,
 }
 
+#[derive(Message)]
+#[rtype(result = "Vec<u32>")]
 pub struct GetInputs;
-
-impl Message for GetInputs {
-    type Result = Inputs;
-}
 
 #[derive(Message)]
 #[rtype(result = "Result<u32, ()>")]
@@ -120,14 +112,14 @@ pub struct ClearOutputCustomSchedule {
 }
 
 #[derive(serde::Serialize)]
-#[derive(Message)]
+#[derive(Clone, Message)]
 #[rtype(result = "()")]
 pub struct RelayStatus {
-    pub inputs: Vec<u32>,
+    pub inputs: Option<Vec<u32>>,
     pub connected: bool,
 }
 
-#[derive(Message, Debug)]
+#[derive(Message)]
 #[rtype(result = "usize")]
 pub struct RegisterForStatus(pub Recipient<RelayStatus>);
 
@@ -198,6 +190,7 @@ impl Actor for RelayActor {
                         line_writer.write("AT+OCMOD=1,100".to_string());
                         act.framed = Some(line_writer);
                         act.connected = true;
+                        act.send_status(RelayStatus { inputs: Some(act.inputs.clone()), connected: true });
                     }
                     Err(err) => {
                         println!("RelayActor failed to resolve: {}", err);
@@ -221,7 +214,7 @@ impl StreamHandler<Result<String, LinesCodecError>> for RelayActor {
     fn handle(&mut self, line: Result<String, LinesCodecError>, ctx: &mut Self::Context) {
         match line {
             Ok(line) => {
-                // println!("{}", line);
+                println!("{}", line);
 
                 if line.starts_with(TIMESW_PATTERN) {
                     self.handle_timesw(line);
@@ -244,9 +237,9 @@ impl StreamHandler<Result<String, LinesCodecError>> for RelayActor {
 }
 
 impl RelayActor {
-    pub fn new(host: String, port: u16, inputs_number: usize, outputs_number: usize) -> Self {
+    pub fn new(host: &str, port: u16, inputs_number: usize, outputs_number: usize) -> Self {
         Self {
-            host,
+            host: String::from(host),
             port,
             inputs_number,
             outputs_number,
@@ -260,19 +253,18 @@ impl RelayActor {
             if Instant::now().duration_since(act.hb) > HEARTBEAT_TIMEOUT {
                 act.connected = false;
 
-                ctx.run_later(Duration::from_secs(5), |_, ctx| {
+                ctx.run_later(Duration::from_secs(5), |act, ctx| {
                     println!("Relay heartbeat failed, disconnecting!");
+                    act.send_status(RelayStatus { inputs: None, connected: false });
                     ctx.stop();
                 });
             }
         });
     }
 
-    fn send_status(&self) {
+    fn send_status(&self, message: RelayStatus) {
         for (id, addr) in &self.clients {
-            let message = RelayStatus { inputs: self.inputs.clone(), connected: self.connected };
-
-            addr.do_send(message).unwrap();
+            addr.do_send(message.clone()).unwrap();
         }
     }
 
@@ -389,8 +381,8 @@ impl RelayActor {
 
         if states_mask != self.inputs_mask {
             self.inputs_mask = states_mask;
-            self.inputs = states;
-            self.send_status();
+            self.inputs = states.clone();
+            self.send_status(RelayStatus { inputs: Some(states), connected: true });
         }
     }
 
@@ -454,14 +446,10 @@ impl Handler<SetSystemTime> for RelayActor {
 }
 
 impl Handler<GetInputs> for RelayActor {
-    type Result = Inputs;
+    type Result = MessageResult<GetInputs>;
 
     fn handle(&mut self, _: GetInputs, _: &mut Context<Self>) -> Self::Result {
-        Inputs {
-            number: self.inputs_number,
-            states: self.inputs.clone(),
-            connected: self.connected,
-        }
+        MessageResult(self.inputs.clone())
     }
 }
 
@@ -569,8 +557,8 @@ impl Handler<RegisterForStatus> for RelayActor {
     ) -> Self::Result {
         let id = self.rng.gen::<usize>();
 
+        client.do_send(RelayStatus { inputs: Some(self.inputs.clone()), connected: true });
         self.clients.insert(id, client);
-        self.send_status();
 
         id
     }

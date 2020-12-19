@@ -4,7 +4,6 @@
 use std::env;
 use std::io::{self, Write};
 use std::process;
-use std::sync::Mutex;
 
 use actix::prelude::*;
 use actix::SystemRegistry;
@@ -16,6 +15,7 @@ use actix_web::http::StatusCode;
 use actix_web_actors::ws;
 use clap;
 use serde_json::json;
+use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "linux")]
 use crate::display::DisplayActor;
@@ -35,8 +35,13 @@ mod display;
 type Port = u16;
 
 struct Program {
-    pub host: String,
-    pub port: u16,
+    pub config: ProgramConfig,
+}
+
+#[derive(Clone, Serialize)]
+struct ProgramConfig {
+    pub relay_host: String,
+    pub relay_port: u16,
     pub inputs_number: usize,
     pub outputs_number: usize,
 }
@@ -107,10 +112,12 @@ impl Program {
             });
 
         Program {
-            host,
-            port,
-            inputs_number,
-            outputs_number,
+            config: ProgramConfig {
+                relay_host: host,
+                relay_port: port,
+                inputs_number,
+                outputs_number,
+            }
         }
     }
 
@@ -124,6 +131,12 @@ async fn ws_index(
     stream: web::Payload,
 ) -> Result<HttpResponse, Error> {
     ws::start(ClientWebSocket::new(), &r, stream)
+}
+
+async fn get_config(config: web::Data<ProgramConfig>) -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .body(json!(config.get_ref()))
 }
 
 async fn get_system_time() -> HttpResponse {
@@ -230,8 +243,10 @@ async fn clear_output_custom_schedule(web::Path(number): web::Path<usize>) -> Ht
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let program = Program::new();
-    let relay = Supervisor::start(move |_| RelayActor::new(program.host, program.port,
-                                                           program.inputs_number, program.outputs_number));
+    let config = program.config;
+    let config_clone = config.clone();
+    let relay = Supervisor::start(move |_| RelayActor::new(config_clone.relay_host.as_str(), config_clone.relay_port,
+                                                           config_clone.inputs_number, config_clone.outputs_number));
 
     SystemRegistry::set(relay.clone());
 
@@ -242,7 +257,9 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(move || {
         App::new()
+            .data(config.clone())
             .service(web::resource("/ws/").route(web::get().to(ws_index)))
+            .route("/config", web::get().to(get_config))
             .route("/system_time", web::get().to(get_system_time))
             .route("/system_time", web::post().to(set_system_time))
             .route("/inputs", web::get().to(inputs))
