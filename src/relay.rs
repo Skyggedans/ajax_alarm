@@ -192,7 +192,13 @@ impl Actor for RelayActor {
                         ctx.add_stream(FramedRead::new(r, LinesCodec::new()));
                         line_writer.write("AT+OCMOD=1,100".to_string());
                         act.framed = Some(line_writer);
-                        act.send_status(RelayStatus { inputs: Some(act.inputs.clone()), outputs: None, connected: true, time: None });
+
+                        act.send_status(RelayStatus {
+                            inputs: Some(act.inputs.clone()),
+                            outputs: None,
+                            connected: true,
+                            time: None,
+                        });
                     }
                     Err(err) => {
                         println!("RelayActor failed to resolve: {}", err);
@@ -255,7 +261,14 @@ impl RelayActor {
             if Instant::now().duration_since(act.hb) > HEARTBEAT_TIMEOUT {
                 ctx.run_later(Duration::from_secs(5), |act, ctx| {
                     println!("Relay heartbeat failed, disconnecting!");
-                    act.send_status(RelayStatus { inputs: None, outputs: None, connected: false, time: None });
+
+                    act.send_status(RelayStatus {
+                        inputs: None,
+                        outputs: None,
+                        connected: false,
+                        time: None,
+                    });
+
                     ctx.stop();
                 });
             }
@@ -264,47 +277,70 @@ impl RelayActor {
 
     fn poll_time(&self, ctx: &mut <Self as Actor>::Context) {
         ctx.run_interval(POLL_STATUSES_INTERVAL, |act, ctx| {
-            if let Some(ref mut line_writer) = act.framed {
-                line_writer.write(format!("AT{}=?", TIME_PATTERN));
-            }
+            act.get_time(ctx).then(|time, act, _| {
+                if let Ok(time) = time {
+                    act.send_status(RelayStatus {
+                        inputs: None,
+                        outputs: None,
+                        connected: true,
+                        time: Some(time),
+                    });
+                }
 
-            act.enqueue_oneshot(format!("{}", TIME_PATTERN))
-                .then(|time: Result<SystemTime, ()>, act, _| {
-                    if let Ok(time) = time {
-                        act.send_status(RelayStatus { inputs: None, outputs: None, connected: true, time: Some(time) });
-                    }
-
-                    fut::ready(())
-                }).spawn(ctx);
+                fut::ready(())
+            })
+                .spawn(ctx);
         });
     }
 
     fn poll_outputs(&self, ctx: &mut <Self as Actor>::Context) {
         ctx.run_interval(POLL_STATUSES_INTERVAL, |act, ctx| {
-            futures_util::stream::iter(1..=act.outputs_number)
-                .into_actor(act)
-                .then(move |output, act, ctx| {
-                    if let Some(ref mut line_writer) = act.framed {
-                        line_writer.write(format!("AT{}{}=?", STACH_PATTERN, output));
-                    }
+            act.get_outputs(ctx).then(|outputs, act, ctx| {
+                if let Ok(outputs) = outputs {
+                    act.send_status(RelayStatus {
+                        inputs: None,
+                        outputs: Some(outputs),
+                        connected: true,
+                        time: None,
+                    });
+                }
 
-                    act.enqueue_oneshot::<u32>(format!("{}{}", STACH_PATTERN, output))
-                })
-                .fold(Vec::<u32>::new(), move |mut acc, output_state, act, ctx| {
-                    if let Ok(output_state) = output_state {
-                        acc.push(output_state);
-                    } else {
-                        acc.push(0);
-                    }
-
-                    fut::ready(acc)
-                })
-                .then(|outputs, act, ctx| {
-                    act.send_status(RelayStatus { inputs: None, outputs: Some(outputs), connected: true, time: None });
-                    fut::ready(())
-                })
+                fut::ready(())
+            })
                 .spawn(ctx);
         });
+    }
+
+    fn get_time(&mut self, ctx: &mut <Self as Actor>::Context) -> Pin<Box<impl ActorFuture<Output=Result<SystemTime, ()>, Actor=Self>>> {
+        if let Some(ref mut line_writer) = self.framed {
+            line_writer.write(format!("AT{}=?", TIME_PATTERN));
+        }
+
+        self.enqueue_oneshot::<SystemTime>(format!("{}", TIME_PATTERN))
+    }
+
+    fn get_outputs(&self, ctx: &mut <Self as Actor>::Context) -> Pin<Box<impl ActorFuture<Output=Result<Vec<u32>, ()>, Actor=Self>>> {
+        Box::pin(futures_util::stream::iter(1..=self.outputs_number)
+            .into_actor(self)
+            .then(move |output, act, ctx| {
+                if let Some(ref mut line_writer) = act.framed {
+                    line_writer.write(format!("AT{}{}=?", STACH_PATTERN, output));
+                }
+
+                act.enqueue_oneshot::<u32>(format!("{}{}", STACH_PATTERN, output))
+            })
+            .fold(Ok(Vec::<u32>::new()), move |mut acc, output_state, act, ctx| {
+                if let Ok(output_state) = output_state {
+                    if let Ok(ref mut acc) = acc {
+                        acc.push(output_state);
+                        fut::ok(acc.clone())
+                    } else {
+                        fut::err(())
+                    }
+                } else {
+                    fut::err(())
+                }
+            }))
     }
 
     fn send_status(&self, message: RelayStatus) {
@@ -379,27 +415,31 @@ impl RelayActor {
 
         let res = match mode {
             1 => {
-                let mut events = split.filter(|item| item.len() == 10).map(|item| {
-                    let (time, state) = item.split_at(9);
+                let mut events = split
+                    .filter(|item| item.len() == 10)
+                    .map(|item| {
+                        let (time, state) = item.split_at(9);
 
-                    DailyEvent {
-                        time: time.trim().to_string(),
-                        state: state.parse::<u32>().unwrap(),
-                    }
-                }).collect::<Vec<DailyEvent>>();
+                        DailyEvent {
+                            time: time.trim().to_string(),
+                            state: state.parse::<u32>().unwrap(),
+                        }
+                    }).collect::<Vec<DailyEvent>>();
 
                 events.reverse();
                 self.fire_oneshot(key, events);
             }
             3 => {
-                let mut events = split.filter(|item| item.len() == 21).map(|item| {
-                    let (date_time, state) = item.split_at(20);
+                let mut events = split
+                    .filter(|item| item.len() == 21)
+                    .map(|item| {
+                        let (date_time, state) = item.split_at(20);
 
-                    CustomEvent {
-                        date_time: date_time.trim().to_string().replace("/", "-"),
-                        state: state.parse::<u32>().unwrap(),
-                    }
-                }).collect::<Vec<CustomEvent>>();
+                        CustomEvent {
+                            date_time: date_time.trim().to_string().replace("/", "-"),
+                            state: state.parse::<u32>().unwrap(),
+                        }
+                    }).collect::<Vec<CustomEvent>>();
 
                 events.reverse();
                 self.fire_oneshot(key, events);
@@ -427,7 +467,13 @@ impl RelayActor {
         if states_mask != self.inputs_mask {
             self.inputs_mask = states_mask;
             self.inputs = states.clone();
-            self.send_status(RelayStatus { inputs: Some(states), outputs: None, connected: true, time: None });
+
+            self.send_status(RelayStatus {
+                inputs: Some(states),
+                outputs: None,
+                connected: true,
+                time: None,
+            });
         }
     }
 
@@ -604,7 +650,13 @@ impl Handler<RegisterForStatus> for RelayActor {
     ) -> Self::Result {
         let id = self.rng.gen::<usize>();
 
-        client.do_send(RelayStatus { inputs: Some(self.inputs.clone()), outputs: None, connected: true, time: None });
+        client.do_send(RelayStatus {
+            inputs: Some(self.inputs.clone()),
+            outputs: None,
+            connected: true,
+            time: None,
+        });
+
         self.clients.insert(id, client);
 
         id
