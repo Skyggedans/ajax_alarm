@@ -4,31 +4,34 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Instant;
 
+use actix::{ActorStream, FinishStream};
 use actix::actors::resolver::{Connect, Resolver};
+use actix::dev::MessageResponse;
 use actix::io::{FramedWrite, WriteHandler};
 use actix::prelude::*;
 use actix::registry::SystemService;
 use actix_web::web;
+use futures_util::stream::{Stream, StreamExt, StreamFuture, TryFold};
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 use tokio::io::{split, WriteHalf};
+use tokio::macros::support::Pin;
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::{channel, Receiver, Sender};
 use tokio::time::{self, Duration, timeout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
-use tokio::macros::support::Pin;
-use actix::dev::MessageResponse;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+const POLL_STATUSES_INTERVAL: Duration = Duration::from_secs(1);
 const OCCH_ALL_PATTERN: &str = "+OCCH_ALL";
 const STACH_PATTERN: &str = "+STACH";
 const TIME_PATTERN: &str = "+TIME";
 const TIMESW_PATTERN: &str = "+TIMESW";
 
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct SystemTime {
     pub date_time: String,
     pub day_of_week: u8,
@@ -116,7 +119,9 @@ pub struct ClearOutputCustomSchedule {
 #[rtype(result = "()")]
 pub struct RelayStatus {
     pub inputs: Option<Vec<u32>>,
+    pub outputs: Option<Vec<u32>>,
     pub connected: bool,
+    pub time: Option<SystemTime>,
 }
 
 #[derive(Message)]
@@ -140,7 +145,6 @@ pub struct RelayActor {
     pub outputs_number: usize,
     inputs: Vec<u32>,
     inputs_mask: u32,
-    connected: bool,
     framed: Option<Framed>,
     hb: Instant,
     rng: ThreadRng,
@@ -158,7 +162,6 @@ impl Default for RelayActor {
             inputs: vec![0u32; 4],
             inputs_mask: 0xff,
             framed: None,
-            connected: false,
             hb: Instant::now(),
             rng: thread_rng(),
             clients: HashMap::new(),
@@ -189,24 +192,23 @@ impl Actor for RelayActor {
                         ctx.add_stream(FramedRead::new(r, LinesCodec::new()));
                         line_writer.write("AT+OCMOD=1,100".to_string());
                         act.framed = Some(line_writer);
-                        act.connected = true;
-                        act.send_status(RelayStatus { inputs: Some(act.inputs.clone()), connected: true });
+                        act.send_status(RelayStatus { inputs: Some(act.inputs.clone()), outputs: None, connected: true, time: None });
                     }
                     Err(err) => {
                         println!("RelayActor failed to resolve: {}", err);
-                        act.connected = false;
                         ctx.stop();
                     }
                 },
                 Err(err) => {
                     println!("RelayActor failed to connect: {}", err);
-                    act.connected = false;
                     ctx.stop();
                 }
             })
             .wait(ctx);
 
         self.hb(ctx);
+        self.poll_time(ctx);
+        self.poll_outputs(ctx);
     }
 }
 
@@ -251,24 +253,67 @@ impl RelayActor {
     fn hb(&self, ctx: &mut <Self as Actor>::Context) {
         ctx.run_interval(HEARTBEAT_INTERVAL, |act, ctx| {
             if Instant::now().duration_since(act.hb) > HEARTBEAT_TIMEOUT {
-                act.connected = false;
-
                 ctx.run_later(Duration::from_secs(5), |act, ctx| {
                     println!("Relay heartbeat failed, disconnecting!");
-                    act.send_status(RelayStatus { inputs: None, connected: false });
+                    act.send_status(RelayStatus { inputs: None, outputs: None, connected: false, time: None });
                     ctx.stop();
                 });
             }
         });
     }
 
+    fn poll_time(&self, ctx: &mut <Self as Actor>::Context) {
+        ctx.run_interval(POLL_STATUSES_INTERVAL, |act, ctx| {
+            if let Some(ref mut line_writer) = act.framed {
+                line_writer.write(format!("AT{}=?", TIME_PATTERN));
+            }
+
+            act.enqueue_oneshot(format!("{}", TIME_PATTERN))
+                .then(|time: Result<SystemTime, ()>, act, _| {
+                    if let Ok(time) = time {
+                        act.send_status(RelayStatus { inputs: None, outputs: None, connected: true, time: Some(time) });
+                    }
+
+                    fut::ready(())
+                }).spawn(ctx);
+        });
+    }
+
+    fn poll_outputs(&self, ctx: &mut <Self as Actor>::Context) {
+        ctx.run_interval(POLL_STATUSES_INTERVAL, |act, ctx| {
+            futures_util::stream::iter(1..=act.outputs_number)
+                .into_actor(act)
+                .then(move |output, act, ctx| {
+                    if let Some(ref mut line_writer) = act.framed {
+                        line_writer.write(format!("AT{}{}=?", STACH_PATTERN, output));
+                    }
+
+                    act.enqueue_oneshot::<u32>(format!("{}{}", STACH_PATTERN, output))
+                })
+                .fold(Vec::<u32>::new(), move |mut acc, output_state, act, ctx| {
+                    if let Ok(output_state) = output_state {
+                        acc.push(output_state);
+                    } else {
+                        acc.push(0);
+                    }
+
+                    fut::ready(acc)
+                })
+                .then(|outputs, act, ctx| {
+                    act.send_status(RelayStatus { inputs: None, outputs: Some(outputs), connected: true, time: None });
+                    fut::ready(())
+                })
+                .spawn(ctx);
+        });
+    }
+
     fn send_status(&self, message: RelayStatus) {
         for (id, addr) in &self.clients {
-            addr.do_send(message.clone()).unwrap();
+            addr.do_send(message.clone()).expect("Unable to send to subscription");
         }
     }
 
-    fn enqueue_oneshot<T: 'static>(&mut self, key: String) -> Pin<Box<impl Future<Output=Result<T, ()>>>> {
+    fn enqueue_oneshot<T: 'static>(&mut self, key: String) -> Pin<Box<impl ActorFuture<Output=Result<T, ()>, Actor=Self>>> {
         let (sender, receiver) = channel();
 
         if let Some(vec) = self.oneshots.get_mut(key.as_str()) {
@@ -280,7 +325,7 @@ impl RelayActor {
             self.oneshots.insert(key, deque);
         }
 
-        Box::pin(async move {
+        Box::pin(fut::wrap_future::<_, Self>(async move {
             let res = time::timeout(Duration::from_secs(10), receiver).await;
 
             if let Ok(Ok(state)) = res {
@@ -288,7 +333,7 @@ impl RelayActor {
             } else {
                 Err(())
             }
-        })
+        }))
     }
 
     fn fire_oneshot<T: 'static>(&mut self, key: String, value: T) {
@@ -307,7 +352,7 @@ impl RelayActor {
         let key = format!("{}", TIME_PATTERN);
 
         let time = SystemTime {
-            date_time: date_time.trim().to_string(),
+            date_time: date_time.trim().to_string().replace("/", "-"),
             day_of_week: day_of_week.parse::<u8>().unwrap(),
         };
 
@@ -351,7 +396,7 @@ impl RelayActor {
                     let (date_time, state) = item.split_at(20);
 
                     CustomEvent {
-                        date_time: date_time.trim().to_string(),
+                        date_time: date_time.trim().to_string().replace("/", "-"),
                         state: state.parse::<u32>().unwrap(),
                     }
                 }).collect::<Vec<CustomEvent>>();
@@ -382,7 +427,7 @@ impl RelayActor {
         if states_mask != self.inputs_mask {
             self.inputs_mask = states_mask;
             self.inputs = states.clone();
-            self.send_status(RelayStatus { inputs: Some(states), connected: true });
+            self.send_status(RelayStatus { inputs: Some(states), outputs: None, connected: true, time: None });
         }
     }
 
@@ -422,7 +467,7 @@ impl SystemService for RelayActor {
 }
 
 impl Handler<GetSystemTime> for RelayActor {
-    type Result = ResponseFuture<Result<SystemTime, ()>>;
+    type Result = ResponseActFuture<Self, Result<SystemTime, ()>>;
 
     fn handle(&mut self, message: GetSystemTime, _: &mut Context<Self>) -> Self::Result {
         if let Some(ref mut line_writer) = self.framed {
@@ -440,7 +485,9 @@ impl Handler<SetSystemTime> for RelayActor {
 
     fn handle(&mut self, message: SetSystemTime, _: &mut Context<Self>) -> Self::Result {
         if let Some(ref mut line_writer) = self.framed {
-            line_writer.write(format!("AT{}={} {}", TIME_PATTERN, message.time.date_time, message.time.day_of_week));
+            let date_time = message.time.date_time.replace("-", "/");
+
+            line_writer.write(format!("AT{}={}", TIME_PATTERN, date_time));
         }
     }
 }
@@ -454,7 +501,7 @@ impl Handler<GetInputs> for RelayActor {
 }
 
 impl Handler<GetOutput> for RelayActor {
-    type Result = ResponseFuture<Result<u32, ()>>;
+    type Result = ResponseActFuture<Self, Result<u32, ()>>;
 
     fn handle(&mut self, message: GetOutput, _: &mut Context<Self>) -> Self::Result {
         if let Some(ref mut line_writer) = self.framed {
@@ -468,7 +515,7 @@ impl Handler<GetOutput> for RelayActor {
 }
 
 impl Handler<GetOutputDailySchedule> for RelayActor {
-    type Result = ResponseFuture<Result<Vec<DailyEvent>, ()>>;
+    type Result = ResponseActFuture<Self, Result<Vec<DailyEvent>, ()>>;
 
     fn handle(&mut self, message: GetOutputDailySchedule, _: &mut Context<Self>) -> Self::Result {
         if let Some(ref mut line_writer) = self.framed {
@@ -503,7 +550,7 @@ impl Handler<ClearOutputDailySchedule> for RelayActor {
 }
 
 impl Handler<GetOutputCustomSchedule> for RelayActor {
-    type Result = ResponseFuture<Result<Vec<CustomEvent>, ()>>;
+    type Result = ResponseActFuture<Self, Result<Vec<CustomEvent>, ()>>;
 
     fn handle(&mut self, message: GetOutputCustomSchedule, _: &mut Context<Self>) -> Self::Result {
         if let Some(ref mut line_writer) = self.framed {
@@ -557,7 +604,7 @@ impl Handler<RegisterForStatus> for RelayActor {
     ) -> Self::Result {
         let id = self.rng.gen::<usize>();
 
-        client.do_send(RelayStatus { inputs: Some(self.inputs.clone()), connected: true });
+        client.do_send(RelayStatus { inputs: Some(self.inputs.clone()), outputs: None, connected: true, time: None });
         self.clients.insert(id, client);
 
         id

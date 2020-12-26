@@ -50,7 +50,7 @@ impl Actor for ClientWebSocket {
 
 impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for ClientWebSocket {
     fn handle(&mut self, msg: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
-        println!("WS: {:?}", msg);
+        //println!("WS: {:?}", msg);
 
         match msg {
             Ok(ws::Message::Ping(msg)) => {

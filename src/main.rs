@@ -261,7 +261,7 @@ async fn main() -> std::io::Result<()> {
             .service(web::resource("/ws/").route(web::get().to(ws_index)))
             .route("/config", web::get().to(get_config))
             .route("/system_time", web::get().to(get_system_time))
-            .route("/system_time", web::post().to(set_system_time))
+            .route("/system_time", web::put().to(set_system_time))
             .route("/inputs", web::get().to(inputs))
             .route("/output/{number}", web::get().to(get_output))
             .route("/output/{number}/{state}", web::post().to(set_output))
